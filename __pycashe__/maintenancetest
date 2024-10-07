@@ -1,0 +1,185 @@
+import RPi.GPIO as GPIO
+import time
+import tkinter as tk
+import threading
+from gotify import Gotify
+import requests
+import psutil
+import logging
+import os
+
+# Logging setup for debugging
+logging.basicConfig(filename='komax_log.txt', level=logging.INFO)
+
+# Push notifications setup (Gotify)
+gotify = Gotify(
+    base_url="https://9e3b-109-234-233-4.ngrok-free.app/",
+    app_token="A3zhpmK_vQnfhfj",
+)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+buzzerpin = 8
+GPIO.setup(buzzerpin, GPIO.OUT)
+GPIO.output(buzzerpin, GPIO.LOW)
+
+# Maintenance status and timers
+maintenance_status = {i: False for i in range(1, 28)}
+timers = {i: 0 for i in range(1, 28)}
+
+# Function to handle system time display
+def update_time():
+    current_time = time.strftime("Date: %d-%m-%Y Time: %H:%M:%S")
+    time_label.config(text=current_time)
+    root.after(1000, update_time)
+
+# Function to toggle maintenance status
+def toggle_maintenance(komax_number):
+    maintenance_status[komax_number] = not maintenance_status[komax_number]
+    button = buttons[komax_number - 1]
+    if maintenance_status[komax_number]:
+        button.config(bg='#007acc', fg='white', relief=tk.SUNKEN)
+        threading.Thread(target=activate_buzzer).start()
+        start_timer(komax_number, button)
+        gotify.create_message(f"Komax {komax_number} called for maintenance", title="SCA", priority=6)
+    else:
+        button.config(bg='#5bc985', fg='black', relief=tk.RAISED)
+
+def reset_maintenance(komax_number):
+    maintenance_status[komax_number] = False
+    buttons[komax_number - 1].config(bg='#5bc985', fg='black', relief="groove")
+
+# Function to activate buzzer
+def activate_buzzer():
+    try:
+        GPIO.output(buzzerpin, GPIO.HIGH)
+        time.sleep(0.3)  # Short buzzer duration
+        GPIO.output(buzzerpin, GPIO.LOW)
+    except Exception as e:
+        logging.error(f"Buzzer error: {str(e)}")
+
+# Timer handling for Komax machines
+def start_timer(komax_number, button):
+    if timers[komax_number] == 0:
+        timers[komax_number] = 5 * 60  # Timer starts at 5 minutes
+        update_timer(komax_number, button)
+
+def update_timer(komax_number, button):
+    if maintenance_status[komax_number] and timers[komax_number] > 0:
+        mins, secs = divmod(timers[komax_number], 60)
+        button.config(text=f"KOMAX {komax_number}\nTime: {mins} min {secs} sec")
+        
+        if timers[komax_number] == 180:  # Yellow alert at 3 minutes
+            button.config(bg='#f9d71c', fg='black')
+        elif timers[komax_number] == 60:  # Red alert at 1 minute
+            button.config(bg='red', fg='white')
+        
+        timers[komax_number] -= 1
+        root.after(1000, update_timer, komax_number, button)
+    else:
+        button.config(text=f"KOMAX {komax_number}")
+        timers[komax_number] = 0
+        reset_maintenance(komax_number)
+
+# Tkinter GUI setup
+root = tk.Tk()
+root.title("Komax Maintenance Status")
+buttons = []
+
+# Create buttons for 27 Komax machines
+for i in range(1, 28):
+    button = tk.Button(
+        root,
+        text=f"KOMAX {i}",
+        bg='#5bc985',  # Green background
+        fg='black',
+        font=("Roboto", 16),
+        command=lambda i=i: toggle_maintenance(i),
+        padx=10,
+        pady=10,
+        width=10,
+        height=2,
+        relief="groove",
+        borderwidth=5
+    )
+    buttons.append(button)
+    row = (i - 1) // 5
+    column = (i - 1) % 5
+    button.grid(row=row, column=column, padx=10, pady=10, sticky="nsew")
+
+# Set grid column and row weights for even distribution
+for i in range(5):
+    root.grid_columnconfigure(i, weight=1, uniform="col_uniform")
+for i in range(6):
+    root.grid_rowconfigure(i, weight=1)
+
+# Time label in the UI
+time_label = tk.Label(root, text="time", font=("Roboto", 10), padx=0, pady=5, anchor="e")
+time_label.grid(row=6, column=4, sticky="ne")
+
+# Start updating time
+update_time()
+
+# Define GPIO pins for rows and columns
+row_pins = [17, 18, 22, 23, 24, 25, 5, 6, 12, 13, 19, 14, 20, 2, 16]
+col_pins = [26, 21]
+
+# GPIO pin setup
+for row_pin in row_pins:
+    GPIO.setup(row_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+for col_pin in col_pins:
+    GPIO.setup(col_pin, GPIO.OUT)
+    GPIO.output(col_pin, GPIO.HIGH)
+
+# Operator maintenance messages
+operator_messages = {
+    1: [(21, 16)], 2: [(26, 18)], 3: [(26, 22)], 4: [(26, 23)], 5: [(26, 24)], 6: [(26, 25)],
+    7: [(26, 5)], 8: [(26, 6)], 9: [(26, 12)], 10: [(26, 13)], 11: [(26, 19)], 12: [(26, 14)],
+    13: [(26, 2)], 14: [(21, 17)], 15: [(21, 18)], 16: [(21, 22)], 17: [(21, 23)], 18: [(21, 24)],
+    19: [(21, 25)], 20: [(21, 5)], 21: [(21, 6)], 22: [(21, 12)], 23: [(21, 13)], 24: [(21, 19)],
+    25: [(26, 16)], 26: [(21, 14)], 27: [(21, 2)]
+}
+
+# Function to check which button is pressed
+def check_buttons():
+    for col_pin in col_pins:
+        GPIO.output(col_pin, GPIO.LOW)
+        for row_pin in row_pins:
+            if GPIO.input(row_pin) == GPIO.LOW:
+                for operator, pins in operator_messages.items():
+                    if (col_pin, row_pin) in pins:
+                        toggle_maintenance(operator)
+        GPIO.output(col_pin, GPIO.HIGH)
+
+# Function to update maintenance status
+def update_maintenance_status():
+    check_buttons()
+    root.after(400, update_maintenance_status)
+
+# Start the maintenance status update loop
+update_maintenance_status()
+
+# System resource monitoring in the UI
+sys_info_label = tk.Label(root, text="", font=("Roboto", 10))
+sys_info_label.grid(row=6, column=0, sticky="w")
+
+def update_system_stats():
+    cpu_usage = psutil.cpu_percent()
+    memory_info = psutil.virtual_memory()
+    sys_info_label.config(text=f"CPU: {cpu_usage}% | RAM: {memory_info.percent}%")
+    root.after(5000, update_system_stats)
+
+# Start system stats update loop
+update_system_stats()
+
+# Start watchdog for Raspberry Pi stability
+def start_watchdog():
+    os.system("sudo systemctl start watchdog")
+
+start_watchdog()
+
+# Tkinter main loop
+root.mainloop()
+
+# Cleanup GPIO after closing
+GPIO.cleanup()
